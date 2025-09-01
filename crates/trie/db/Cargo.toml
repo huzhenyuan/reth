@@ -24,6 +24,9 @@ alloy-primitives.workspace = true
 # tracing
 tracing.workspace = true
 
+# rayon
+rayon = "1.8"
+
 [dev-dependencies]
 # reth
 reth-chainspec.workspace = true

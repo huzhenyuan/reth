@@ -6,6 +6,7 @@ use core::{
     marker::PhantomData,
     ops::{Deref, RangeInclusive},
 };
+use rayon::prelude::*;
 use reth_db_api::{
     cursor::DbCursorRO,
     models::{AccountBeforeTx, BlockNumberAddress},
@@ -41,36 +42,61 @@ impl<TX, KH> Deref for PrefixSetLoader<'_, TX, KH> {
 impl<TX: DbTx, KH: KeyHasher> PrefixSetLoader<'_, TX, KH> {
     /// Load all account and storage changes for the given block range.
     pub fn load(self, range: RangeInclusive<BlockNumber>) -> Result<TriePrefixSets, DatabaseError> {
-        // Initialize prefix sets.
         let mut account_prefix_set = PrefixSetMut::default();
         let mut storage_prefix_sets = HashMap::<B256, PrefixSetMut>::default();
         let mut destroyed_accounts = HashSet::default();
 
-        // Walk account changeset and insert account prefixes.
+        // 收集所有需要处理的地址和存储键
+        let mut addresses = Vec::new();
+        let mut storage_entries = Vec::new();
+
+        // 收集账户变更数据
         let mut account_changeset_cursor = self.cursor_read::<tables::AccountChangeSets>()?;
         let mut account_hashed_state_cursor = self.cursor_read::<tables::HashedAccounts>()?;
         for account_entry in account_changeset_cursor.walk_range(range.clone())? {
             let (_, AccountBeforeTx { address, .. }) = account_entry?;
-            let hashed_address = KH::hash_key(address);
-            account_prefix_set.insert(Nibbles::unpack(hashed_address));
+            addresses.push(address);
+        }
 
-            if account_hashed_state_cursor.seek_exact(hashed_address)?.is_none() {
-                destroyed_accounts.insert(hashed_address);
+        // 并行计算地址哈希
+        let hashed_addresses: Vec<_> = addresses
+            .par_iter()
+            .map(|&address| (address, KH::hash_key(address)))
+            .collect();
+
+        // 处理地址哈希结果
+        for (_, hashed_address) in &hashed_addresses {
+            account_prefix_set.insert(Nibbles::unpack(*hashed_address));
+            if account_hashed_state_cursor.seek_exact(*hashed_address)?.is_none() {
+                destroyed_accounts.insert(*hashed_address);
             }
         }
 
-        // Walk storage changeset and insert storage prefixes as well as account prefixes if missing
-        // from the account prefix set.
+        // 收集存储变更数据
         let mut storage_cursor = self.cursor_dup_read::<tables::StorageChangeSets>()?;
         let storage_range = BlockNumberAddress::range(range);
         for storage_entry in storage_cursor.walk_range(storage_range)? {
             let (BlockNumberAddress((_, address)), StorageEntry { key, .. }) = storage_entry?;
-            let hashed_address = KH::hash_key(address);
+            storage_entries.push((address, key));
+        }
+
+        // 并行计算存储键哈希
+        let storage_hashes: Vec<_> = storage_entries
+            .par_iter()
+            .map(|&(address, key)| {
+                let hashed_address = KH::hash_key(address);
+                let hashed_key = KH::hash_key(key);
+                (hashed_address, hashed_key)
+            })
+            .collect();
+
+        // 处理存储哈希结果
+        for (hashed_address, hashed_key) in storage_hashes {
             account_prefix_set.insert(Nibbles::unpack(hashed_address));
             storage_prefix_sets
                 .entry(hashed_address)
                 .or_default()
-                .insert(Nibbles::unpack(KH::hash_key(key)));
+                .insert(Nibbles::unpack(hashed_key));
         }
 
         Ok(TriePrefixSets {
