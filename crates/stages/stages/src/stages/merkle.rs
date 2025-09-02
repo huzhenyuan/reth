@@ -18,6 +18,7 @@ use reth_stages_api::{
 use reth_trie::{IntermediateStateRootState, StateRoot, StateRootProgress, StoredSubNode};
 use reth_trie_db::DatabaseStateRoot;
 use std::fmt::Debug;
+use std::time::{Duration, Instant};
 use tracing::*;
 
 // TODO: automate the process outlined below so the user can just send in a debugging package
@@ -173,6 +174,9 @@ where
 
     /// Execute the stage.
     fn execute(&mut self, provider: &Provider, input: ExecInput) -> Result<ExecOutput, StageError> {
+        let start_time = Instant::now();
+        info!(target: "sync::stages::merkle::exec", "Starting merkle stage execution");
+
         let (threshold, incremental_threshold) = match self {
             Self::Unwind => {
                 info!(target: "sync::stages::merkle::unwind", "Stage is always skipped");
@@ -191,6 +195,14 @@ where
         let (from_block, to_block) = range.clone().into_inner();
         let current_block_number = input.checkpoint().block_number;
 
+        info!(
+            target: "sync::stages::merkle::exec",
+            "Block range: {} -> {}, current: {}",
+            from_block,
+            to_block,
+            current_block_number
+        );
+
         let target_block = provider
             .header_by_number(to_block)?
             .ok_or_else(|| ProviderError::HeaderNotFound(to_block.into()))?;
@@ -198,8 +210,16 @@ where
 
         let mut checkpoint = self.get_execution_checkpoint(provider)?;
         let (trie_root, entities_checkpoint) = if range.is_empty() {
+            info!(target: "sync::stages::merkle::exec", "Range is empty, using target block root");
             (target_block_root, input.checkpoint().entities_stage_checkpoint().unwrap_or_default())
         } else if to_block - from_block > threshold || from_block == 1 {
+            let rebuild_start = Instant::now();
+            info!(
+                target: "sync::stages::merkle::exec",
+                "Starting full trie rebuild, range size: {}",
+                to_block - from_block
+            );
+
             // if there are more blocks than threshold it is faster to rebuild the trie
             let mut entities_checkpoint = if let Some(checkpoint) =
                 checkpoint.as_ref().filter(|c| c.target_block == to_block)
@@ -237,6 +257,18 @@ where
             });
 
             let tx = provider.tx_ref();
+
+            // 计算数据库大小
+            let account_count = tx.entries::<tables::HashedAccounts>()?;
+            let storage_count = tx.entries::<tables::HashedStorages>()?;
+
+            info!(
+                target: "sync::stages::merkle::exec",
+                "Database stats before rebuild - Accounts: {}, Storage entries: {}",
+                account_count,
+                storage_count
+            );
+
             let progress = StateRoot::from_tx(tx)
                 .with_intermediate_state(checkpoint.map(IntermediateStateRootState::from))
                 .root_with_progress()
@@ -244,8 +276,18 @@ where
                     error!(target: "sync::stages::merkle", %e, ?current_block_number, ?to_block, "State root with progress failed! {INVALID_STATE_ROOT_ERROR_MESSAGE}");
                     StageError::Fatal(Box::new(e))
                 })?;
+
             match progress {
                 StateRootProgress::Progress(state, hashed_entries_walked, updates) => {
+                    let elapsed = rebuild_start.elapsed();
+                    info!(
+                        target: "sync::stages::merkle::exec",
+                        "Intermediate progress - Entries processed: {}, Time: {:.2}s, Speed: {:.2} entries/s",
+                        hashed_entries_walked,
+                        elapsed.as_secs_f64(),
+                        hashed_entries_walked as f64 / elapsed.as_secs_f64()
+                    );
+
                     provider.write_trie_updates(&updates)?;
 
                     let mut checkpoint = MerkleCheckpoint::new(
@@ -289,6 +331,15 @@ where
                     })
                 }
                 StateRootProgress::Complete(root, hashed_entries_walked, updates) => {
+                    let elapsed = rebuild_start.elapsed();
+                    info!(
+                        target: "sync::stages::merkle::exec",
+                        "Rebuild completed - Total entries: {}, Time: {:.2}s, Speed: {:.2} entries/s",
+                        hashed_entries_walked,
+                        elapsed.as_secs_f64(),
+                        hashed_entries_walked as f64 / elapsed.as_secs_f64()
+                    );
+
                     provider.write_trie_updates(&updates)?;
 
                     entities_checkpoint.processed += hashed_entries_walked as u64;
@@ -297,28 +348,64 @@ where
                 }
             }
         } else {
-            debug!(target: "sync::stages::merkle::exec", current = ?current_block_number, target = ?to_block, "Updating trie in chunks");
+            let incremental_start = Instant::now();
+            info!(
+                target: "sync::stages::merkle::exec",
+                "Starting incremental update with threshold: {}",
+                incremental_threshold
+            );
+
             let mut final_root = None;
+            let mut total_processed = 0;
+            let mut chunk_times = Vec::new();
+
             for start_block in range.step_by(incremental_threshold as usize) {
+                let chunk_start = Instant::now();
                 let chunk_to = std::cmp::min(start_block + incremental_threshold, to_block);
                 let chunk_range = start_block..=chunk_to;
-                debug!(
+
+                info!(
                     target: "sync::stages::merkle::exec",
-                    current = ?current_block_number,
-                    target = ?to_block,
-                    incremental_threshold,
-                    chunk_range = ?chunk_range,
-                    "Processing chunk"
+                    "Processing chunk: {} -> {}",
+                    start_block,
+                    chunk_to
                 );
+
                 let (root, updates) =
-                StateRoot::incremental_root_with_updates(provider.tx_ref(), chunk_range)
-                    .map_err(|e| {
-                        error!(target: "sync::stages::merkle", %e, ?current_block_number, ?to_block, "Incremental state root failed! {INVALID_STATE_ROOT_ERROR_MESSAGE}");
-                        StageError::Fatal(Box::new(e))
-                    })?;
+                    StateRoot::incremental_root_with_updates(provider.tx_ref(), chunk_range)
+                        .map_err(|e| {
+                            error!(target: "sync::stages::merkle", %e, ?current_block_number, ?to_block, "Incremental state root failed! {INVALID_STATE_ROOT_ERROR_MESSAGE}");
+                            StageError::Fatal(Box::new(e))
+                        })?;
+
+                let chunk_duration = chunk_start.elapsed();
+                chunk_times.push(chunk_duration);
+                total_processed += chunk_to - start_block + 1;
+
+                let avg_chunk_time = chunk_times.iter().sum::<Duration>() / chunk_times.len() as u32;
+
+                info!(
+                    target: "sync::stages::merkle::exec",
+                    "Chunk completed - Range: {} -> {}, Time: {:.2}s, Avg time: {:.2}s, Progress: {}/{} blocks",
+                    start_block,
+                    chunk_to,
+                    chunk_duration.as_secs_f64(),
+                    avg_chunk_time.as_secs_f64(),
+                    total_processed,
+                    to_block - from_block + 1
+                );
+
                 provider.write_trie_updates(&updates)?;
                 final_root = Some(root);
             }
+
+            let total_time = incremental_start.elapsed();
+            info!(
+                target: "sync::stages::merkle::exec",
+                "Incremental update completed - Total time: {:.2}s, Avg chunk time: {:.2}s",
+                total_time.as_secs_f64(),
+                chunk_times.iter().sum::<Duration>().as_secs_f64() / chunk_times.len() as f64
+            );
 
             // if we had no final root, we must have not looped above, which should not be possible
             let final_root = final_root.ok_or(StageError::Fatal(
@@ -339,6 +426,13 @@ where
             // Save the checkpoint
             (final_root, entities_checkpoint)
         };
+
+        let total_execution_time = start_time.elapsed();
+        info!(
+            target: "sync::stages::merkle::exec",
+            "Merkle stage completed - Total execution time: {:.2}s",
+            total_execution_time.as_secs_f64()
+        );
 
         // Reset the checkpoint
         self.save_execution_checkpoint(provider, None)?;
